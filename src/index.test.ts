@@ -191,37 +191,113 @@ describe("waiting message", () => {
     pendingResolve!(new Response(null));
     await p;
   });
+
+  it("keeps counting while server prefills (headers sent, no SSE yet), stops at first event", async () => {
+    vi.useFakeTimers();
+    startAgent();
+    const encoder = new TextEncoder();
+    let push: (chunk: string) => void = () => {};
+    const src = new ReadableStream<Uint8Array>({
+      start(controller) {
+        push = (chunk: string) => controller.enqueue(encoder.encode(chunk));
+      },
+    });
+    // TabbyAPI sends headers immediately while prefill runs: the ticker
+    // must keep counting instead of freezing at header arrival.
+    pending = Promise.resolve(new Response(src));
+    const res = await globalThis.fetch(CHAT_URL, { body: JSON.stringify({ stream: true }) });
+    vi.advanceTimersByTime(1500);
+    expect(lastWidgetLine()).toContain("Waiting for response... (1s)");
+    push('data: {"choices":[{"delta":{"content":"x"},"finish_reason":null}]}\n');
+    const reader = res.body!.getReader();
+    await reader.read();
+    const calls = ui.setWidget.mock.calls.length;
+    vi.advanceTimersByTime(3000);
+    // interval must be cleared once the first SSE event arrives
+    expect(ui.setWidget.mock.calls.length).toBe(calls);
+  });
 });
 
-describe("turn-end toast", () => {
-  it("notifies formatted TPS once per turn", async () => {
+describe("TabbyAPI-style streams (no prompt_progress / timings events)", () => {
+  it("shows 'Generating...' during generation and toasts TPS from final usage", async () => {
     startAgent();
     nextResponse = new Response(sseStream([
-      'data: {"timings":{"predicted_per_second":24.5,"predicted_ms":1200}}\n',
+      'data: {"choices":[{"delta":{"content":"hi"},"finish_reason":null}]}\r\n',
+      'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":25,"prompt_time":0.14,"prompt_tokens_per_sec":178.57,"completion_tokens":10,"completion_time":1.2,"completion_tokens_per_sec":8.3,"total_tokens":35,"total_time":1.34}}\r\n',
+      "data: [DONE]\n",
+    ]));
+    const res = await globalThis.fetch(CHAT_URL, { body: JSON.stringify({ stream: true }) });
+    await readAll(res.body!);
+    expect(anyWidgetLine()).toContain("Generating...");
+
+    handlers["turn_end"](null, { ui, hasUI: true });
+    handlers["agent_end"](null, { ui, hasUI: true });
+    expect(ui.notify).toHaveBeenCalledTimes(1);
+    expect(ui.notify).toHaveBeenCalledWith(
+      "Prefill: 178.6 tok/s (140ms) | Generation: 8.3 tok/s (1.2s)",
+    );
+  });
+
+  it("standard OpenAI usage (no stats) yields no toast", async () => {
+    startAgent();
+    nextResponse = new Response(sseStream([
+      'data: {"choices":[{"delta":{"content":"hi"},"finish_reason":null}]}\r\n',
+      'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}\r\n',
       "data: [DONE]\n",
     ]));
     const res = await globalThis.fetch(CHAT_URL, { body: JSON.stringify({ stream: true }) });
     await readAll(res.body!);
 
     handlers["turn_end"](null, { ui, hasUI: true });
-    expect(ui.notify).toHaveBeenCalledTimes(1);
-    expect(ui.notify).toHaveBeenCalledWith("Generation: 24.5 tok/s (1.2s)");
+    handlers["agent_end"](null, { ui, hasUI: true });
+    expect(ui.notify).not.toHaveBeenCalled();
+  });
+});
 
-    // Second turn_end (e.g. empty follow-up turn): no timings, no notify
+describe("run-end toast", () => {
+  it("notifies aggregate TPS once per agent run (not per tool step)", async () => {
+    startAgent();
+    // Step 1: tool-calling response
+    nextResponse = new Response(sseStream([
+      'data: {"timings":{"predicted_n":100,"predicted_ms":1000,"prompt_n":50,"prompt_ms":500}}\n',
+      "data: [DONE]\n",
+    ]));
+    const res1 = await globalThis.fetch(CHAT_URL, { body: JSON.stringify({ stream: true }) });
+    await readAll(res1.body!);
     handlers["turn_end"](null, { ui, hasUI: true });
+    expect(ui.notify).not.toHaveBeenCalled(); // no per-step toast
+
+    // Step 2: final response
+    nextResponse = new Response(sseStream([
+      'data: {"timings":{"predicted_n":50,"predicted_ms":1000,"prompt_n":100,"prompt_ms":500}}\n',
+      "data: [DONE]\n",
+    ]));
+    const res2 = await globalThis.fetch(CHAT_URL, { body: JSON.stringify({ stream: true }) });
+    await readAll(res2.body!);
+    handlers["turn_end"](null, { ui, hasUI: true });
+    expect(ui.notify).not.toHaveBeenCalled();
+
+    handlers["agent_end"](null, { ui, hasUI: true });
+    expect(ui.notify).toHaveBeenCalledTimes(1);
+    expect(ui.notify).toHaveBeenCalledWith("Prefill: 150.0 tok/s (1s) | Generation: 75.0 tok/s (2s)");
+
+    // Next run: fresh totals, no stale toast
+    handlers["agent_start"](null, { ui, hasUI: true });
+    handlers["agent_end"](null, { ui, hasUI: true });
     expect(ui.notify).toHaveBeenCalledTimes(1);
   });
 
   it("no toast when generation below elapsed threshold", async () => {
     startAgent();
     nextResponse = new Response(sseStream([
-      'data: {"timings":{"predicted_per_second":24.5,"predicted_ms":10}}\n',
+      'data: {"timings":{"predicted_n":2,"predicted_ms":10}}\n',
       "data: [DONE]\n",
     ]));
     const res = await globalThis.fetch(CHAT_URL, { body: JSON.stringify({ stream: true }) });
     await readAll(res.body!);
 
     handlers["turn_end"](null, { ui, hasUI: true });
+    handlers["agent_end"](null, { ui, hasUI: true });
     expect(ui.notify).not.toHaveBeenCalled();
   });
 });

@@ -16,7 +16,9 @@ import {
   createProgressState,
   getWorkingMessage,
   shouldClearPrefill,
-  formatTps,
+  createTurnStats,
+  accumulateStep,
+  formatTurnStats,
   ensureStreamOptions,
   captureStream,
   applyEvent,
@@ -30,6 +32,14 @@ let originalFetch: typeof fetch | null = null;
 let wrappedFetch: typeof fetch | null = null;
 let uiRef: ExtensionUIContext | null = null;
 let hasUIRef = false;
+let waitInterval: ReturnType<typeof setInterval> | null = null;
+
+function stopWait(): void {
+  if (waitInterval) {
+    clearInterval(waitInterval);
+    waitInterval = null;
+  }
+}
 
 // Progress renders in an extension widget (not the working message): pi
 // replaces the status line with a fixed "Compacting..." indicator during
@@ -58,6 +68,12 @@ function widgetFactory(line: string) {
 // are separate processes with their own fetch). A new request resets it so
 // an aborted request's leftover events cannot leak into the next one.
 const state: ProgressState = createProgressState();
+
+// Aggregate timings for the current agent run (one user prompt). pi fires
+// turn_end per LLM response (one per tool step); the toast reports the
+// whole run once, at agent_end. agent_settled is deferred while queued
+// follow-up messages remain, so it is unreliable for per-run reporting.
+const turnStats = createTurnStats();
 
 // ─── UI update ───────────────────────────────────────────────────────────────
 
@@ -110,16 +126,26 @@ export default function (pi: ExtensionAPI) {
         // uiRef is nulled by session_shutdown; a pending fetch can still be
         // ticking at that point.
         if (!uiRef || !hasUIRef) return;
+        // Real progress (llama.cpp prompt_progress) or generation has taken
+        // over; don't clobber it.
+        if (state.isGenerating || state.currentProgress) return;
         const secs = Math.floor((Date.now() - waitStart) / 1000);
         uiRef.setWidget(WIDGET_KEY, widgetFactory(`Waiting for response... (${secs}s)`));
       };
       tick(); // first tick immediate, no half-second blind spot
-      const waitInterval = setInterval(tick, 500);
+      // Stays armed until the first SSE event: servers like TabbyAPI send
+      // HTTP headers immediately while prefill is still running, so
+      // clearing on header arrival would freeze the counter mid-prefill.
+      waitInterval = setInterval(tick, 500);
       try {
         const response = await originalFetch!(input, init);
-        clearInterval(waitInterval);
         if (response.ok && response.body) {
+          let firstEvent = true;
           return new Response(captureStream(response.body, (ev) => {
+            if (firstEvent) {
+              firstEvent = false;
+              stopWait();
+            }
             if (applyEvent(state, ev)) updateUi();
           }), {
             status: response.status,
@@ -127,9 +153,10 @@ export default function (pi: ExtensionAPI) {
             headers: new Headers(response.headers),
           });
         }
+        stopWait();
         return response;
       } catch (err) {
-        clearInterval(waitInterval);
+        stopWait();
         throw err;
       }
     }
@@ -153,23 +180,33 @@ export default function (pi: ExtensionAPI) {
     if (uiRef && hasUIRef) uiRef.setWidget(WIDGET_KEY, widgetFactory("Compacting..."));
   });
 
-  pi.on("turn_end", (_event: any, ctx: ExtensionContext) => {
-    if (ctx.hasUI) {
-      const timings = state.latestTimings;
-      const display = timings ? formatTps(timings) : null;
-      // Toast only, no footer duplication, no prefix.
-      if (display) ctx.ui.notify(display);
-    }
+  pi.on("turn_end", (_event: any, _ctx: ExtensionContext) => {
+    // Per LLM response: fold this step's final timings into the run totals.
+    // The toast fires once at agent_end.
+    accumulateStep(turnStats, state.latestTimings);
     resetForNextTurn(state);
   });
 
+  pi.on("agent_end", (_event: any, ctx: ExtensionContext) => {
+    if (ctx.hasUI) {
+      const display = formatTurnStats(turnStats);
+      // Toast only, no footer duplication, no prefix.
+      if (display) ctx.ui.notify(display);
+    }
+  });
+
   // Safety clear: an aborted request never sends [DONE], so the widget
-  // could linger past an abort.
+  // could linger past an abort. Also stops a waiting ticker that never saw
+  // an SSE event (aborted before the stream opened), and starts fresh run
+  // totals (agent_start also precedes auto-retry/compaction runs).
   pi.on("agent_start", () => {
+    stopWait();
     clearWidget();
+    Object.assign(turnStats, createTurnStats());
   });
 
   pi.on("session_shutdown", () => {
+    stopWait();
     if (uiRef && hasUIRef) uiRef.setWidget(WIDGET_KEY, undefined);
     uiRef = null;
     hasUIRef = false;

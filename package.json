@@ -1,11 +1,12 @@
 {
   "name": "pi-llama-progress",
   "version": "0.1.0",
-  "description": "Progress bar + TPS overlay for pi with llama.cpp. Live prefill/generation progress and end-of-turn stats on top of pi's built-in llama.cpp provider.",
+  "description": "Progress bar + TPS overlay for pi with llama.cpp and TabbyAPI. Live prefill/generation progress where the server exposes it, plus end-of-turn stats.",
   "keywords": [
     "pi-package",
     "pi-extension",
-    "llama-cpp"
+    "llama-cpp",
+    "tabbyapi"
   ],
   "main": "./src/index.ts",
   "type": "module",

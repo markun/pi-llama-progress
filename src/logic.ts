@@ -37,6 +37,9 @@ export interface ProgressState {
   generationTokens: number;
   tokenCountFromServer: boolean;
   isGenerating: boolean;
+  // Local clock of generation start (fallback display for servers without
+  // per-token timings, e.g. TabbyAPI)
+  generationStartMs: number | null;
   // UI throttle
   lastUiUpdateMs: number;
   // TPS display
@@ -49,6 +52,7 @@ export function createProgressState(): ProgressState {
     generationTokens: 0,
     tokenCountFromServer: false,
     isGenerating: false,
+    generationStartMs: null,
     lastUiUpdateMs: 0,
     latestTimings: null,
   };
@@ -92,7 +96,7 @@ export function buildPrefillMessage(p: PromptProgress): string {
 
 // ─── Working message (prefill progress + generation TPS) ─────────────────────
 
-export function getWorkingMessage(s: ProgressState): string | null {
+export function getWorkingMessage(s: ProgressState, now: number = Date.now()): string | null {
   // Generation phase — show TPS from server-provided stats (no local clock).
   if (s.isGenerating) {
     const tps = s.latestTimings?.predicted_per_second;
@@ -105,6 +109,12 @@ export function getWorkingMessage(s: ProgressState): string | null {
       elapsedMs >= MIN_GEN_ELAPSED_MS
     ) {
       return `${tps.toFixed(1)} tok/s (${s.generationTokens} tokens)`;
+    }
+    // Server without per-token timings (e.g. TabbyAPI): no rate is
+    // available mid-stream, so show elapsed time only.
+    if (s.generationStartMs !== null) {
+      const secs = Math.max(0, Math.floor((now - s.generationStartMs) / 1000));
+      return `Generating... (${secs}s)`;
     }
     return null;
   }
@@ -139,12 +149,59 @@ export function formatTps(data: Timings): string | null {
   return `Prefill: ${prompt.toFixed(1)} tok/s${promptTime ? ` (${promptTime})` : ""} | ${gen}`;
 }
 
+// ─── Per-agent-run stats accumulation ─────────────────────────────────────────────────
+
+// pi fires turn_end for every LLM response within a user turn (one per tool
+// step), so per-step timings are accumulated and reported once at agent_end.
+export interface TurnStats {
+  promptN: number;
+  promptMs: number;
+  completionN: number;
+  completionMs: number;
+}
+
+export function createTurnStats(): TurnStats {
+  return { promptN: 0, promptMs: 0, completionN: 0, completionMs: 0 };
+}
+
+// Fold one step's final timings into the running totals. Steps without
+// usable generation stats (e.g. below the elapsed threshold) are skipped.
+export function accumulateStep(t: TurnStats, step: Timings | null | undefined): void {
+  if (
+    step &&
+    step.predicted_n &&
+    step.predicted_n > 0 &&
+    step.predicted_ms &&
+    step.predicted_ms >= MIN_GEN_ELAPSED_MS
+  ) {
+    t.completionN += step.predicted_n;
+    t.completionMs += step.predicted_ms;
+  }
+  if (step && step.prompt_n && step.prompt_n > 0 && step.prompt_ms && step.prompt_ms > 0) {
+    t.promptN += step.prompt_n;
+    t.promptMs += step.prompt_ms;
+  }
+}
+
+// Aggregate TPS across all steps of the run, formatted like formatTps.
+export function formatTurnStats(t: TurnStats): string | null {
+  if (!t.completionN || !t.completionMs || t.completionMs < MIN_GEN_ELAPSED_MS) return null;
+  const genTps = t.completionN / (t.completionMs / 1000);
+  const genTime = fmtTime(t.completionMs);
+  const gen = `Generation: ${genTps.toFixed(1)} tok/s${genTime ? ` (${genTime})` : ""}`;
+  if (!t.promptN || !t.promptMs) return gen;
+  const promptTps = t.promptN / (t.promptMs / 1000);
+  const promptTime = fmtTime(t.promptMs);
+  return `Prefill: ${promptTps.toFixed(1)} tok/s${promptTime ? ` (${promptTime})` : ""} | ${gen}`;
+}
+
 // ─── Request boundary reset ──────────────────────────────────────────────────
 
 export function resetGenerationState(s: ProgressState): void {
   s.isGenerating = false;
   s.generationTokens = 0;
   s.tokenCountFromServer = false;
+  s.generationStartMs = null;
 }
 
 export function resetForNextRequest(s: ProgressState): void {
@@ -212,6 +269,33 @@ function applyStreamOptions(p: Record<string, any>): void {
   }
 }
 
+// ─── Usage → Timings mapping ─────────────────────────────────────────────────
+
+// Some servers (TabbyAPI) put full timing stats in the final `usage` chunk
+// instead of streaming per-token `timings` events. Standard OpenAI usage has
+// no timing fields, so the mapping only applies when the generation
+// rate is present. Returns null when no usable stats are found.
+export function usageToTimings(u: unknown): Timings | null {
+  if (!u || typeof u !== "object") return null;
+  const r = u as Record<string, unknown>;
+  const num = (v: unknown): number | undefined => {
+    const n = typeof v === "string" ? Number(v) : (v as number | undefined);
+    return typeof n === "number" && Number.isFinite(n) ? n : undefined;
+  };
+  const genTps = num(r.completion_tokens_per_sec);
+  if (genTps === undefined) return null;
+  const completionTimeS = num(r.completion_time);
+  const promptTimeS = num(r.prompt_time);
+  return {
+    predicted_n: num(r.completion_tokens),
+    predicted_ms: completionTimeS !== undefined ? Math.round(completionTimeS * 1000) : undefined,
+    predicted_per_second: genTps,
+    prompt_n: num(r.prompt_tokens),
+    prompt_ms: promptTimeS !== undefined ? Math.round(promptTimeS * 1000) : undefined,
+    prompt_per_second: num(r.prompt_tokens_per_sec),
+  };
+}
+
 // ─── SSE stream capture (pure) ───────────────────────────────────────────────
 
 // Wraps a server response body, parses SSE `data:` lines, and invokes
@@ -277,9 +361,12 @@ export type SseEvent =
   | { kind: "other" };
 
 // Extract the payload of an SSE data line; null for other event types.
-// Per the SSE spec the space after "data:" is optional.
+// Per the SSE spec the space after "data:" is optional. Lines may carry a
+// trailing carriage return (CRLF servers, e.g. TabbyAPI) while LF-only
+// servers (llama-server) do not; `.` cannot match a line terminator, so the
+// trailing `\r` must be consumed explicitly.
 function dataPayload(line: string): string | null {
-  const m = line.match(/^data:\ ?(.*)$/);
+  const m = line.match(/^data:\ ?(.*)\r?$/);
   return m ? m[1] : null;
 }
 
@@ -291,9 +378,11 @@ export function parseSseLine(jsonStr: string): SseEvent {
     if (chunk.prompt_progress) return { kind: "prompt_progress", progress: chunk.prompt_progress };
     if (chunk.timings) return { kind: "timings", timings: chunk.timings };
     if (chunk.usage) return { kind: "usage", usage: chunk.usage };
-    if (chunk.choices?.[0]?.delta?.content) {
-      return { kind: "content", content: chunk.choices[0].delta.content };
-    }
+    const delta = chunk.choices?.[0]?.delta;
+    // reasoning_content (thinking models, e.g. Qwen via TabbyAPI) counts as
+    // generated content for progress purposes.
+    if (delta?.content) return { kind: "content", content: delta.content };
+    if (delta?.reasoning_content) return { kind: "content", content: delta.reasoning_content };
     return { kind: "other" };
   } catch {
     return { kind: "other" };
@@ -302,12 +391,19 @@ export function parseSseLine(jsonStr: string): SseEvent {
 
 // Apply an SSE event to state. Returns true if a working-message update
 // should be triggered by the caller.
-export function applyEvent(s: ProgressState, ev: SseEvent): boolean {
+export function applyEvent(s: ProgressState, ev: SseEvent, now: number = Date.now()): boolean {
   switch (ev.kind) {
     case "done":
-    case "usage":
       resetForNextRequest(s);
       return true;
+    case "usage": {
+      // TabbyAPI-style final chunk: carry the timing stats into the
+      // turn-end toast. Standard OpenAI usage maps to null and is ignored.
+      const t = usageToTimings(ev.usage);
+      if (t) s.latestTimings = t;
+      resetForNextRequest(s);
+      return true;
+    }
     case "prompt_progress":
       s.currentProgress = ev.progress;
       return true;
@@ -316,6 +412,7 @@ export function applyEvent(s: ProgressState, ev: SseEvent): boolean {
       if (!s.isGenerating && prefillComplete(s.currentProgress)) {
         s.isGenerating = true;
         s.generationTokens = 0;
+        s.generationStartMs = now;
       }
       if (s.isGenerating && ev.timings.predicted_n !== undefined) {
         // Server predicted_n is authoritative. Discard any local content-chunk
@@ -329,7 +426,10 @@ export function applyEvent(s: ProgressState, ev: SseEvent): boolean {
       return false;
     }
     case "content":
-      if (!s.isGenerating) s.isGenerating = true;
+      if (!s.isGenerating) {
+        s.isGenerating = true;
+        s.generationStartMs = now;
+      }
       // Local fallback count; superseded once server timings arrive
       if (!s.tokenCountFromServer) s.generationTokens++;
       return true;

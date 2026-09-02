@@ -6,12 +6,16 @@ import {
   buildPrefillMessage,
   prefillComplete,
   formatTps,
+  createTurnStats,
+  accumulateStep,
+  formatTurnStats,
   fmtTime,
   formatDuration,
   captureStream,
   ensureStreamOptions,
   parseSseLine,
   applyEvent,
+  usageToTimings,
   resetGenerationState,
   resetForNextTurn,
   MIN_GEN_ELAPSED_MS,
@@ -103,6 +107,63 @@ describe("getWorkingMessage", () => {
       predicted_ms: MIN_GEN_ELAPSED_MS + 50,
     };
     expect(getWorkingMessage(s)).toBe("24.5 tok/s (42 tokens)");
+  });
+  it("falls back to 'Generating... (Ns)' when server sends no timings", () => {
+    const s = createProgressState();
+    s.isGenerating = true;
+    s.generationStartMs = 1000;
+    expect(getWorkingMessage(s, 3499)).toBe("Generating... (2s)");
+  });
+  it("server timings take precedence over the local fallback", () => {
+    const s = createProgressState();
+    s.isGenerating = true;
+    s.generationStartMs = 1000;
+    s.generationTokens = 42;
+    s.latestTimings = {
+      predicted_per_second: 24.5,
+      predicted_ms: MIN_GEN_ELAPSED_MS + 50,
+    };
+    expect(getWorkingMessage(s, 3499)).toBe("24.5 tok/s (42 tokens)");
+  });
+});
+
+describe("usageToTimings", () => {
+  it("maps TabbyAPI usage stats to Timings", () => {
+    const t = usageToTimings({
+      prompt_tokens: 25,
+      prompt_time: 0.14,
+      prompt_tokens_per_sec: 178.57,
+      completion_tokens: 294,
+      completion_time: 2.06,
+      completion_tokens_per_sec: 142.64,
+      total_tokens: 319,
+      total_time: 2.21,
+    });
+    expect(t).toEqual({
+      predicted_n: 294,
+      predicted_ms: 2060,
+      predicted_per_second: 142.64,
+      prompt_n: 25,
+      prompt_ms: 140,
+      prompt_per_second: 178.57,
+    });
+  });
+  it("returns null for standard OpenAI usage (no timing fields)", () => {
+    expect(usageToTimings({ prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 })).toBeNull();
+  });
+  it("returns null for non-object input", () => {
+    expect(usageToTimings(null)).toBeNull();
+    expect(usageToTimings("x")).toBeNull();
+    expect(usageToTimings(undefined)).toBeNull();
+  });
+  it("coerces string numbers (TabbyAPI schema allows string rates)", () => {
+    const t = usageToTimings({
+      completion_tokens: 10,
+      completion_time: "1.0",
+      completion_tokens_per_sec: "12.5",
+    });
+    expect(t?.predicted_per_second).toBe(12.5);
+    expect(t?.predicted_ms).toBe(1000);
   });
 });
 
@@ -289,6 +350,29 @@ describe("captureStream", () => {
     await reader.cancel();
     expect(upstreamCancelled).toBe(true);
   });
+
+  it("parses CRLF-framed streams (TabbyAPI sends \r\n, llama-server \n)", async () => {
+    const events: string[] = [];
+    const stream = captureStream(
+      oneChunk(
+        'data: {"choices":[{"delta":{"content":"hi"},"finish_reason":null}]}\r\n\r\n' +
+          'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"completion_tokens":3,"completion_time":1.0,"completion_tokens_per_sec":3.0}}\r\n\r\n' +
+          'data: [DONE]\r\n\r\n',
+      ),
+      (ev) => events.push(ev.kind),
+    );
+    const reader = stream.getReader();
+    while (!(await reader.read()).done) { /* drain */ }
+    expect(events).toEqual(["content", "usage", "done"]);
+  });
+
+  it("parses CRLF when the final line has no trailing newline", async () => {
+    const events: string[] = [];
+    const stream = captureStream(oneChunk('data: [DONE]\r'), (ev) => events.push(ev.kind));
+    const reader = stream.getReader();
+    while (!(await reader.read()).done) { /* drain */ }
+    expect(events).toEqual(["done"]);
+  });
 });
 
 describe("parseSseLine", () => {
@@ -310,6 +394,10 @@ describe("parseSseLine", () => {
   it("parses content delta", () => {
     const ev = parseSseLine(JSON.stringify({ choices: [{ delta: { content: "hi" } }] }));
     expect(ev).toEqual({ kind: "content", content: "hi" });
+  });
+  it("parses reasoning_content delta as content (thinking models)", () => {
+    const ev = parseSseLine(JSON.stringify({ choices: [{ delta: { reasoning_content: "hmm" } }] }));
+    expect(ev).toEqual({ kind: "content", content: "hmm" });
   });
   it("returns other on invalid json", () => {
     expect(parseSseLine("not json")).toEqual({ kind: "other" });
@@ -358,6 +446,44 @@ describe("applyEvent", () => {
     expect(s.generationTokens).toBe(2);
   });
 
+  it("content flip records generation start time", () => {
+    const s = createProgressState();
+    applyEvent(s, { kind: "content", content: "a" }, 1234);
+    expect(s.generationStartMs).toBe(1234);
+  });
+
+  it("usage with timing stats stores final timings for the turn-end toast", () => {
+    const s = createProgressState();
+    s.isGenerating = true;
+    applyEvent(s, {
+      kind: "usage",
+      usage: {
+        prompt_tokens: 5,
+        prompt_time: 0.1,
+        prompt_tokens_per_sec: 50,
+        completion_tokens: 10,
+        completion_time: 1.2,
+        completion_tokens_per_sec: 8.3,
+      },
+    });
+    expect(s.latestTimings?.predicted_per_second).toBe(8.3);
+    expect(s.latestTimings?.predicted_ms).toBe(1200);
+    expect(s.latestTimings?.prompt_per_second).toBe(50);
+    // request-boundary reset still happened
+    expect(s.isGenerating).toBe(false);
+    expect(s.generationStartMs).toBeNull();
+  });
+
+  it("usage without timing fields leaves latestTimings untouched", () => {
+    const s = createProgressState();
+    s.latestTimings = { predicted_per_second: 24.5, predicted_ms: 1200 };
+    applyEvent(s, {
+      kind: "usage",
+      usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
+    });
+    expect(s.latestTimings).toEqual({ predicted_per_second: 24.5, predicted_ms: 1200 });
+  });
+
   it("local content count is discarded when server count arrives", () => {
     const s = createProgressState();
     s.currentProgress = { total: 10, processed: 10 };
@@ -378,6 +504,13 @@ describe("applyEvent", () => {
     s.tokenCountFromServer = true;
     resetGenerationState(s);
     expect(s.tokenCountFromServer).toBe(false);
+  });
+
+  it("reset clears generation start time", () => {
+    const s = createProgressState();
+    s.generationStartMs = 5;
+    resetGenerationState(s);
+    expect(s.generationStartMs).toBeNull();
   });
 
   it("other event leaves state untouched and requests no update", () => {
@@ -407,5 +540,35 @@ describe("resetForNextTurn", () => {
     resetForNextTurn(s);
     expect(s.latestTimings).toBeNull();
     expect(s.lastUiUpdateMs).toBe(0);
+  });
+});
+
+describe("run stats accumulation", () => {
+  it("accumulates multiple steps and formats aggregate TPS", () => {
+    const t = createTurnStats();
+    accumulateStep(t, { predicted_n: 100, predicted_ms: 1000, prompt_n: 50, prompt_ms: 500 });
+    accumulateStep(t, { predicted_n: 50, predicted_ms: 1000, prompt_n: 100, prompt_ms: 500 });
+    expect(formatTurnStats(t)).toBe("Prefill: 150.0 tok/s (1s) | Generation: 75.0 tok/s (2s)");
+  });
+
+  it("skips steps below the generation elapsed threshold", () => {
+    const t = createTurnStats();
+    accumulateStep(t, { predicted_n: 2, predicted_ms: 10 });
+    accumulateStep(t, { predicted_n: 100, predicted_ms: 1000 });
+    expect(formatTurnStats(t)).toBe("Generation: 100.0 tok/s (1s)");
+  });
+
+  it("null when no usable stats accumulated", () => {
+    expect(formatTurnStats(createTurnStats())).toBeNull();
+    const t = createTurnStats();
+    accumulateStep(t, null);
+    accumulateStep(t, { prompt_n: 10, prompt_ms: 100 }); // prompt only, no generation
+    expect(formatTurnStats(t)).toBeNull();
+  });
+
+  it("generation-only format when a step has no prompt stats", () => {
+    const t = createTurnStats();
+    accumulateStep(t, { predicted_n: 200, predicted_ms: 1000 });
+    expect(formatTurnStats(t)).toBe("Generation: 200.0 tok/s (1s)");
   });
 });
