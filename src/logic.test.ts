@@ -566,6 +566,19 @@ describe("run stats accumulation", () => {
     expect(formatTurnStats(t)).toBeNull();
   });
 
+  it("derives prefill rate from server rate when prompt_n includes cached tokens (TabbyAPI)", () => {
+    const t = createTurnStats();
+    // TabbyAPI: prompt_n = total (cached + new), prompt_per_second = new only
+    accumulateStep(t, {
+      predicted_n: 68,
+      predicted_ms: 2240,
+      prompt_n: 27638,
+      prompt_ms: 730,
+      prompt_per_second: 336.99,
+    });
+    expect(formatTurnStats(t)).toBe("Prefill: 337.0 tok/s (730ms) | Generation: 30.4 tok/s (2.2s)");
+  });
+
   it("generation-only format when a step has no prompt stats", () => {
     const t = createTurnStats();
     accumulateStep(t, { predicted_n: 200, predicted_ms: 1000 });

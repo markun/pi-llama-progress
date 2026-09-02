@@ -178,7 +178,13 @@ export function accumulateStep(t: TurnStats, step: Timings | null | undefined): 
     t.completionMs += step.predicted_ms;
   }
   if (step && step.prompt_n && step.prompt_n > 0 && step.prompt_ms && step.prompt_ms > 0) {
-    t.promptN += step.prompt_n;
+    // TabbyAPI reports prompt_n as total tokens (cached included) while
+    // prompt_per_second is new tokens only; deriving the count from the
+    // server rate keeps the aggregate a true new-token rate. llama-server
+    // rates are consistent with prompt_n, so the derivation is a no-op.
+    t.promptN += step.prompt_per_second
+      ? step.prompt_per_second * (step.prompt_ms / 1000)
+      : step.prompt_n;
     t.promptMs += step.prompt_ms;
   }
 }
