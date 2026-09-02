@@ -403,6 +403,30 @@ describe("widget lifecycle", () => {
     handlers["agent_start"](null, { ui, hasUI: true });
     expect(ui.setWidget).toHaveBeenLastCalledWith("pi-llama-progress", undefined);
   });
+
+  it("clears waiting ticker on agent_settled (aborted before first SSE event)", async () => {
+    vi.useFakeTimers();
+    startAgent();
+    // Stream that never emits an event: pi aborts it while waiting
+    nextResponse = new Response(new ReadableStream<Uint8Array>({ start() {} }));
+    await globalThis.fetch(CHAT_URL, { body: JSON.stringify({ stream: true }) });
+    expect(lastWidgetLine()).toContain("Waiting for response...");
+    handlers["agent_settled"](null, { ui, hasUI: true, isIdle: () => true });
+    expect(ui.setWidget).toHaveBeenLastCalledWith("pi-llama-progress", undefined);
+    // Ticker stopped: advancing time no longer updates the widget
+    const calls = ui.setWidget.mock.calls.length;
+    vi.advanceTimersByTime(2000);
+    expect(ui.setWidget.mock.calls.length).toBe(calls);
+  });
+
+  it("keeps widget on agent_settled while another run is active", async () => {
+    vi.useFakeTimers();
+    startAgent();
+    nextResponse = new Response(new ReadableStream<Uint8Array>({ start() {} }));
+    await globalThis.fetch(CHAT_URL, { body: JSON.stringify({ stream: true }) });
+    handlers["agent_settled"](null, { ui, hasUI: true, isIdle: () => false });
+    expect(lastWidgetLine()).toContain("Waiting for response...");
+  });
 });
 
 describe("session_shutdown", () => {

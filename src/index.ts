@@ -195,10 +195,22 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  // Safety clear: an aborted request never sends [DONE], so the widget
-  // could linger past an abort. Also stops a waiting ticker that never saw
-  // an SSE event (aborted before the stream opened), and starts fresh run
-  // totals (agent_start also precedes auto-retry/compaction runs).
+  // Abort safety: an aborted run never sends [DONE], so the widget (waiting
+  // ticker, prefill bar, or generation TPS) can linger. settled + isIdle
+  // means no retry, compaction, or queued continuation will start a new
+  // run, so this is the point where clearing is always safe. (agent_end
+  // alone cannot distinguish abort from a normal end; agent_start only
+  // fires if the user starts another run.)
+  pi.on("agent_settled", (_event: any, ctx: ExtensionContext) => {
+    if (ctx.isIdle()) {
+      stopWait();
+      clearWidget();
+    }
+  });
+
+  // Fresh-run reset: clear any widget left by an aborted previous run
+  // (agent_settled already clears at abort time; this also covers
+  // auto-retry/compaction runs) and start fresh run totals.
   pi.on("agent_start", () => {
     stopWait();
     clearWidget();
