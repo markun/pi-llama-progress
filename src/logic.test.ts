@@ -5,7 +5,6 @@ import {
   shouldClearPrefill,
   buildPrefillMessage,
   prefillComplete,
-  formatTps,
   createTurnStats,
   accumulateStep,
   formatTurnStats,
@@ -193,26 +192,6 @@ describe("shouldClearPrefill", () => {
     const s = createProgressState();
     s.currentProgress = { total: 10, processed: 9 };
     expect(shouldClearPrefill(s)).toBe(false);
-  });
-});
-
-describe("formatTps", () => {
-  it("null when predicted missing or below threshold", () => {
-    expect(formatTps({})).toBeNull();
-    expect(formatTps({ predicted_per_second: 10, predicted_ms: MIN_GEN_ELAPSED_MS - 1 })).toBeNull();
-  });
-  it("generation-only format", () => {
-    const out = formatTps({ predicted_per_second: 24.5, predicted_ms: 1200 });
-    expect(out).toBe("Generation: 24.5 tok/s (1.2s)");
-  });
-  it("prefill + generation format", () => {
-    const out = formatTps({
-      predicted_per_second: 24.5,
-      predicted_ms: 1200,
-      prompt_per_second: 120.3,
-      prompt_ms: 800,
-    });
-    expect(out).toBe("Prefill: 120.3 tok/s (800ms) | Generation: 24.5 tok/s (1.2s)");
   });
 });
 

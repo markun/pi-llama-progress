@@ -136,22 +136,6 @@ export function shouldClearPrefill(s: ProgressState): boolean {
   return !s.isGenerating && prefillComplete(s.currentProgress);
 }
 
-// ─── End-of-turn TPS display ─────────────────────────────────────────────────
-
-export function formatTps(data: Timings): string | null {
-  const predicted = data.predicted_per_second;
-  const prompt = data.prompt_per_second;
-  const predictedMs = data.predicted_ms;
-  const promptMs = data.prompt_ms;
-  if (!predicted || predicted <= 0 || !predictedMs || predictedMs < MIN_GEN_ELAPSED_MS)
-    return null;
-  const genTime = fmtTime(predictedMs);
-  const gen = `Generation: ${predicted.toFixed(1)} tok/s${genTime ? ` (${genTime})` : ""}`;
-  if (!prompt || prompt <= 0) return gen;
-  const promptTime = fmtTime(promptMs);
-  return `Prefill: ${prompt.toFixed(1)} tok/s${promptTime ? ` (${promptTime})` : ""} | ${gen}`;
-}
-
 // ─── Per-agent-run stats accumulation ─────────────────────────────────────────────────
 
 // pi fires turn_end for every LLM response within a user turn (one per tool
@@ -198,7 +182,7 @@ export function accumulateStep(t: TurnStats, step: Timings | null | undefined): 
   }
 }
 
-// Aggregate TPS across all steps of the run, formatted like formatTps.
+// Aggregate TPS across all steps of the run, for the end-of-run toast.
 export function formatTurnStats(t: TurnStats): string | null {
   if (!t.completionN || !t.completionMs || t.completionMs < MIN_GEN_ELAPSED_MS) return null;
   const genTps = t.completionN / (t.completionMs / 1000);
