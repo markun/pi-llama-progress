@@ -551,6 +551,35 @@ describe("run stats accumulation", () => {
     expect(formatTurnStats(t)).toBe("Prefill: 150.0 tok/s (1s) | Generation: 75.0 tok/s (2s)");
   });
 
+  it("appends draft acceptance when a draft model ran", () => {
+    const t = createTurnStats();
+    accumulateStep(t, {
+      predicted_n: 100,
+      predicted_ms: 1000,
+      prompt_n: 50,
+      prompt_ms: 500,
+      draft_n: 140,
+      draft_n_accepted: 120,
+    });
+    accumulateStep(t, {
+      predicted_n: 50,
+      predicted_ms: 1000,
+      prompt_n: 100,
+      prompt_ms: 500,
+      draft_n: 10,
+      draft_n_accepted: 0,
+    });
+    expect(formatTurnStats(t)).toBe(
+      "Prefill: 150.0 tok/s (1s) | Generation: 75.0 tok/s (2s) | Draft: 80.0% (120/150)"
+    );
+  });
+
+  it("omits the draft segment when no draft counters were reported", () => {
+    const t = createTurnStats();
+    accumulateStep(t, { predicted_n: 100, predicted_ms: 1000, prompt_n: 50, prompt_ms: 500 });
+    expect(formatTurnStats(t)).toBe("Prefill: 100.0 tok/s (500ms) | Generation: 100.0 tok/s (1s)");
+  });
+
   it("skips steps below the generation elapsed threshold", () => {
     const t = createTurnStats();
     accumulateStep(t, { predicted_n: 2, predicted_ms: 10 });

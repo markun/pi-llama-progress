@@ -28,6 +28,9 @@ export interface Timings {
   prompt_n?: number;
   prompt_ms?: number;
   prompt_per_second?: number;
+  // Present only when a draft model ran (llama.cpp data-driven emission)
+  draft_n?: number;
+  draft_n_accepted?: number;
 }
 
 export interface ProgressState {
@@ -158,10 +161,12 @@ export interface TurnStats {
   promptMs: number;
   completionN: number;
   completionMs: number;
+  draftN: number;
+  draftAccepted: number;
 }
 
 export function createTurnStats(): TurnStats {
-  return { promptN: 0, promptMs: 0, completionN: 0, completionMs: 0 };
+  return { promptN: 0, promptMs: 0, completionN: 0, completionMs: 0, draftN: 0, draftAccepted: 0 };
 }
 
 // Fold one step's final timings into the running totals. Steps without
@@ -176,6 +181,10 @@ export function accumulateStep(t: TurnStats, step: Timings | null | undefined): 
   ) {
     t.completionN += step.predicted_n;
     t.completionMs += step.predicted_ms;
+  }
+  if (step?.draft_n) {
+    t.draftN += step.draft_n;
+    t.draftAccepted += step.draft_n_accepted ?? 0;
   }
   if (step && step.prompt_n && step.prompt_n > 0 && step.prompt_ms && step.prompt_ms > 0) {
     // TabbyAPI reports prompt_n as total tokens (cached included) while
@@ -198,7 +207,11 @@ export function formatTurnStats(t: TurnStats): string | null {
   if (!t.promptN || !t.promptMs) return gen;
   const promptTps = t.promptN / (t.promptMs / 1000);
   const promptTime = fmtTime(t.promptMs);
-  return `Prefill: ${promptTps.toFixed(1)} tok/s${promptTime ? ` (${promptTime})` : ""} | ${gen}`;
+  const base = `Prefill: ${promptTps.toFixed(1)} tok/s${promptTime ? ` (${promptTime})` : ""} | ${gen}`;
+  // Only servers with an active draft model report draft counters
+  if (!t.draftN) return base;
+  const rate = t.draftAccepted / t.draftN;
+  return `${base} | Draft: ${(rate * 100).toFixed(1)}% (${t.draftAccepted}/${t.draftN})`;
 }
 
 // ─── Request boundary reset ──────────────────────────────────────────────────
